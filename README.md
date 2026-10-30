@@ -20,7 +20,12 @@ AstrBot / Cline / Continue / iShellPro 之类的客户端指过来，就都带�
 dsh plugin --profile desktop add github:1292858901/dsh-persona-gateway
 ```
 
-或把仓库克隆到本地后，用插件管理器的 `install_bundle` 指向该目录。
+插件市场里的安装按钮走的也是这条 git 命令。
+
+> **推荐只用这一种方式。** 不要对同一个 profile 用 `install_bundle` 指向本地目录——
+> 那条路会把 `node_modules/dsh-persona-gateway` 变成符号链接，之后换回 git / npm
+> 安装时 pnpm 无法覆盖它，会报 `ERR_PNPM_EPERM ... rename`。
+> 已经踩到请直接看 [TROUBLESHOOTING.md](./TROUBLESHOOTING.md)，一行命令解决。
 
 装好后打开 **设置 → 人格网关**（「插件」页里的同一张卡片也是同一个面板）。
 
@@ -79,11 +84,30 @@ export ANTHROPIC_AUTH_TOKEN=sk-l2-...
 
 人格注入 `system`，记忆注入最后一条 user 消息。
 
+## 本地开发
+
+需要「改完即刻生效」时，才用本地目录安装（会产生符号链接）：
+
+```bash
+dsh plugin --profile desktop add link:C:/path/to/dsh-persona-gateway
+```
+
+**切回正式安装前，先删掉这一行**，否则会命中 `EPERM`：
+
+```powershell
+Remove-Item "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-persona-gateway" -Recurse -Force
+```
+
 ## 已知限制
 
 - 检索是关键词打分（中文二元组 + 英文词），不依赖 embedding
 - 记忆不能跨设备自动同步，迁移靠导出/导入或拷贝目录
 - Anthropic 侧只从 `text_delta` 收集文本用于记忆抽取，`tool_use` 原样透传不参与
+
+## 安装失败
+
+`ERR_PNPM_EPERM ... rename ..._tmp_xxx -> dsh-persona-gateway` / 提示「没有写入权限」：
+见 [TROUBLESHOOTING.md](./TROUBLESHOOTING.md)，一行命令可解。
 
 ## License
 
