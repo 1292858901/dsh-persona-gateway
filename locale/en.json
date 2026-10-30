@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Persona Gateway",
+    "description": "Turns your DeepSeek account into an OpenAI-compatible endpoint that carries your persona and long-term memory to every client."
+  }
+}
