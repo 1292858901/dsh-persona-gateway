@@ -1,8 +1,8 @@
 {
   "name": "dsh-persona-gateway",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "type": "module",
-  "description": "把自己的 DeepSeek 账号变成带人格与长期记忆的 OpenAI 兼容端点。 · Persona + long-term memory as an OpenAI-compatible endpoint.",
+  "description": "把自己的 DeepSeek 账号变成带人格与长期记忆的 OpenAI / Anthropic 兼容端点。 · Persona + long-term memory as an OpenAI- and Anthropic-compatible endpoint.",
   "icon": "icon.svg",
   "license": "MIT",
   "exports": {

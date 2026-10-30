@@ -21,6 +21,7 @@ const DEFAULTS = {
   port: 8787,
   publicBase: '',
   upstream: 'https://api.deepseek.com/v1',
+  anthropicBase: '',
   model: 'deepseek-flash',
   apiKey: '',
   autoMemory: true,
@@ -76,6 +77,7 @@ function normalizeConfig(raw) {
     autoCompact: merged.autoCompact !== false,
     apiKey: typeof merged.apiKey === 'string' ? merged.apiKey : '',
     upstream: String(merged.upstream || DEFAULTS.upstream).replace(/\/+$/, ''),
+    anthropicBase: String(merged.anthropicBase || '').trim().replace(/\/+$/, ''),
     model: String(merged.model || DEFAULTS.model),
     keys: Array.isArray(merged.keys) ? merged.keys.filter((k) => k && k.id && k.hash) : [],
   }
@@ -173,8 +175,15 @@ function newKey(name) {
 function bearerOf(req) {
   const header = String(req.headers.authorization || '')
   if (/^bearer\s+/i.test(header)) return header.replace(/^bearer\s+/i, '').trim()
-  const apiKey = String(req.headers['api-key'] || '').trim()
+  const apiKey = String(req.headers['x-api-key'] || req.headers['api-key'] || '').trim()
   return apiKey || ''
+}
+
+// DeepSeek 自带 Anthropic 兼容端点：https://api.deepseek.com/anthropic
+function anthropicEndpoint(cfg) {
+  if (cfg.anthropicBase) return `${cfg.anthropicBase}/v1/messages`
+  const root = cfg.upstream.replace(/\/v1$/, '')
+  return `${root}/anthropic/v1/messages`
 }
 
 function keyMatches(keys, token) {
@@ -598,24 +607,32 @@ function unauthorized(res, message) {
 
 // ---------------------------------------------------------------- 数据面
 
-async function handleChat(req, res, dir, instance) {
-  const cfg = await readConfig(dir)
-
+async function authorizeClient(req, cfg, instance, dir, res) {
   // 二级 API Key：创建过就必须带；没创建时只允许本机（便于首次配置）
   if (cfg.keys.length) {
     const token = bearerOf(req)
     const key = keyMatches(cfg.keys, token)
     if (!key) {
       instance.log.add('error', '请求被拒：二级 API Key 无效或缺失')
-      return unauthorized(res, 'persona-gateway: 无效的 API Key。在「人格网关」里创建一个，作为 Bearer token 使用。')
+      unauthorized(res, 'persona-gateway: 无效的 API Key。在「人格网关」里创建一个，作为 Bearer token 使用。')
+      return false
     }
     if (!key.lastUsedAt || Date.now() - key.lastUsedAt > 5 * 60 * 1000) {
       key.lastUsedAt = Date.now()
       await writeConfig(dir, cfg).catch(() => {})
     }
-  } else if (!isLoopback(req)) {
-    return unauthorized(res, 'persona-gateway: 还没有创建二级 API Key，只允许本机调用。')
+    return true
   }
+  if (!isLoopback(req)) {
+    unauthorized(res, 'persona-gateway: 还没有创建二级 API Key，只允许本机调用。')
+    return false
+  }
+  return true
+}
+
+async function handleChat(req, res, dir, instance) {
+  const cfg = await readConfig(dir)
+  if (!(await authorizeClient(req, cfg, instance, dir, res))) return
 
   const body = JSON.parse(await readBody(req))
   const messages = Array.isArray(body.messages) ? body.messages : []
@@ -718,6 +735,150 @@ async function handleChat(req, res, dir, instance) {
   scheduleExtract(dir, cfg, instance, auth.token, messages, json?.choices?.[0]?.message?.content || '')
 }
 
+// ---------------------------------------------------------------- Anthropic /v1/messages
+//
+// DeepSeek 提供 Anthropic 兼容端点，所以这里只做「注入 + 透传」，不做协议转换。
+
+function anthropicText(content) {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content.map((block) => (block && block.type === 'text' ? block.text : '')).join('')
+  }
+  return ''
+}
+
+function injectAnthropic(body, personaBlock, tailBlock) {
+  const out = { ...body }
+  const system = out.system
+  if (typeof system === 'string' && system.trim()) {
+    out.system = personaBlock + '\n\n---\n\n' + system
+  } else if (Array.isArray(system)) {
+    out.system = [{ type: 'text', text: personaBlock + '\n\n---\n\n' }, ...system]
+  } else {
+    out.system = personaBlock
+  }
+
+  const msgs = Array.isArray(out.messages) ? [...out.messages] : []
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role !== 'user') continue
+    const content = msgs[i].content
+    if (typeof content === 'string') {
+      msgs[i] = { ...msgs[i], content: tailBlock + '\n\n' + content }
+    } else if (Array.isArray(content)) {
+      msgs[i] = { ...msgs[i], content: [{ type: 'text', text: tailBlock + '\n\n' }, ...content] }
+    } else {
+      msgs[i] = { ...msgs[i], content: tailBlock }
+    }
+    break
+  }
+  out.messages = msgs
+  return out
+}
+
+async function handleMessages(req, res, dir, instance) {
+  const cfg = await readConfig(dir)
+  if (!(await authorizeClient(req, cfg, instance, dir, res))) return
+
+  const auth = await resolveUpstream(instance, cfg)
+  if (!auth) {
+    instance.log.add('error', '请求被拒：没有可用的上游凭证')
+    return unauthorized(
+      res,
+      instance.accountRejected
+        ? 'persona-gateway: DSH 账号凭证被上游拒绝，请在配置里填一个 DeepSeek API Key。'
+        : 'persona-gateway: 没有上游凭证。在 DSH 登录账号，或在配置里填 DeepSeek API Key。',
+    )
+  }
+
+  const body = JSON.parse(await readBody(req))
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  const query = anthropicText(([...messages].reverse().find((m) => m && m.role === 'user') || {}).content)
+
+  const [persona, memories] = await Promise.all([readPersona(dir), loadMemories(dir)])
+  const picked = selectMemories(memories, query, MAX_CHARS, TOP_K)
+  const payload = injectAnthropic(body, buildPersonaBlock(persona), buildTailBlock(picked))
+  const injectedChars = picked.reduce((n, m) => n + String(m.text || '').length, 0)
+
+  instance.log.add(
+    'request',
+    `${payload.model || cfg.model} · anthropic · 注入 ${picked.length} 条（${injectedChars} 字符）· 凭证 ${auth.source === 'account' ? 'DSH 账号' : '配置'}${payload.stream ? ' · 流式' : ''}`,
+  )
+
+  const controller = new AbortController()
+  res.on('close', () => {
+    if (!res.writableEnded) controller.abort()
+  })
+
+  let upstream
+  try {
+    upstream = await fetch(anthropicEndpoint(cfg), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${auth.token}`,
+        'anthropic-version': String(req.headers['anthropic-version'] || '2023-06-01'),
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+  } catch (err) {
+    instance.log.add('error', `Anthropic 上游不可达：${oneLine(err.message)}`)
+    return sendJson(res, 502, { error: { message: 'persona-gateway: 上游不可达 — ' + err.message } })
+  }
+
+  if (!upstream.ok) {
+    const detail = await upstream.text()
+    instance.log.add('error', `Anthropic 上游 ${upstream.status}：${oneLine(detail, 160)}`)
+    res.writeHead(upstream.status, { 'content-type': 'application/json; charset=utf-8' })
+    res.end(detail)
+    return
+  }
+
+  const plain = messages.map((m) => ({ role: m.role, content: anthropicText(m.content) }))
+
+  if (payload.stream) {
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no',
+    })
+    let buffer = ''
+    let answer = ''
+    for await (const chunk of upstream.body) {
+      res.write(chunk)
+      buffer += Buffer.from(chunk).toString('utf8')
+      let idx
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx).trimEnd()
+        buffer = buffer.slice(idx + 1)
+        if (!line.startsWith('data:')) continue
+        const data = line.slice(5).trim()
+        if (!data || data === '[DONE]') continue
+        try {
+          const evt = JSON.parse(data)
+          if (evt.type === 'content_block_delta' && evt.delta && evt.delta.type === 'text_delta') {
+            answer += evt.delta.text || ''
+          }
+        } catch {
+          // 非 JSON 行，忽略
+        }
+      }
+    }
+    res.end()
+    scheduleExtract(dir, cfg, instance, auth.token, plain, answer)
+    return
+  }
+
+  const json = await upstream.json()
+  res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify(json))
+  const answer = Array.isArray(json.content)
+    ? json.content.filter((b) => b && b.type === 'text').map((b) => b.text).join('')
+    : ''
+  scheduleExtract(dir, cfg, instance, auth.token, plain, answer)
+}
+
 function createDataServer(dir, instance) {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', 'http://localhost')
@@ -763,6 +924,10 @@ function createDataServer(dir, instance) {
 
       if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
         return await handleChat(req, res, dir, instance)
+      }
+
+      if ((url.pathname === '/v1/messages' || url.pathname === '/anthropic/v1/messages') && req.method === 'POST') {
+        return await handleMessages(req, res, dir, instance)
       }
 
       return sendJson(res, 404, { error: { message: 'not found' } })
@@ -847,6 +1012,7 @@ async function publicState(dir, instance) {
     error: instance.error,
     addresses,
     upstream: cfg.upstream,
+    anthropicEndpoint: anthropicEndpoint(cfg),
     model: cfg.model,
     autoMemory: cfg.autoMemory,
     maxMemories: cfg.maxMemories,
@@ -900,6 +1066,7 @@ async function handleControl(req, res, url, dir, instance) {
     if (typeof body.publicBase === 'string') next.publicBase = body.publicBase.trim().replace(/\/+$/, '')
     if (typeof body.model === 'string' && body.model.trim()) next.model = body.model.trim()
     if (typeof body.upstream === 'string' && body.upstream.trim()) next.upstream = body.upstream.trim().replace(/\/+$/, '')
+    if (typeof body.anthropicBase === 'string') next.anthropicBase = body.anthropicBase.trim().replace(/\/+$/, '')
     if (typeof body.autoMemory === 'boolean') next.autoMemory = body.autoMemory
     if (typeof body.autoCompact === 'boolean') next.autoCompact = body.autoCompact
     if (body.maxMemories !== undefined) {

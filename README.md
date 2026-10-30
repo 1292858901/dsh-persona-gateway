@@ -67,11 +67,23 @@ dsh plugin --profile desktop add github:1292858901/dsh-persona-gateway
 - 记忆是明文，可能包含服务器地址之类的敏感信息，导出分享前请自己检查
 - 二级 Key 只存 SHA-256 哈希，面板只能看到前缀和尾号
 
+## 兼容 Anthropic 的客户端
+
+Claude Code 这类走 Anthropic Messages 协议的客户端也能接，网关透传到
+DeepSeek 的 Anthropic 兼容端点（`https://api.deepseek.com/anthropic`）：
+
+```bash
+export ANTHROPIC_BASE_URL=http://192.168.0.58:8787   # 结尾不要加 /v1
+export ANTHROPIC_AUTH_TOKEN=sk-l2-...
+```
+
+人格注入 `system`，记忆注入最后一条 user 消息。
+
 ## 已知限制
 
-- 只有 Chat Completions，没有 Anthropic `/v1/messages`
 - 检索是关键词打分（中文二元组 + 英文词），不依赖 embedding
 - 记忆不能跨设备自动同步，迁移靠导出/导入或拷贝目录
+- Anthropic 侧只从 `text_delta` 收集文本用于记忆抽取，`tool_use` 原样透传不参与
 
 ## License
 
